@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 from pathlib import Path
+import queue
 import socket
 import ssl
 import subprocess
@@ -19,6 +20,27 @@ def openssl(folder, *args):
     result = subprocess.run(['openssl', *args], cwd=folder, capture_output=True, text=True)
     if result.returncode:
         raise RuntimeError(result.stderr)
+
+
+def export_client(folder):
+    """Reempacota a identidade existente para o importador PKCS12 do Android 8–10."""
+    # O importador antigo pode reportar "senha incorreta" ao receber PBES2/PBKDF2.
+    # 3DES/SHA-1 se aplicam só à proteção deste arquivo de laboratório, não ao TLS
+    # nem à assinatura SHA-256 dos certificados. Não usar RC2 nem arquivo sem senha.
+    with tempfile.NamedTemporaryFile(prefix='.client-', suffix='.p12', dir=folder,
+                                     delete=False) as temp:
+        output = Path(temp.name)
+    try:
+        openssl(folder, 'pkcs12', '-export', '-inkey', 'client.key', '-in', 'client.crt',
+                '-certfile', 'ca.crt', '-name', 'android-lab', '-out', str(output),
+                '-keypbe', 'PBE-SHA1-3DES', '-certpbe', 'PBE-SHA1-3DES',
+                '-macalg', 'sha1', '-iter', '2048', '-passout', 'pass:lab-android')
+        openssl(folder, 'pkcs12', '-in', str(output), '-noout',
+                '-passin', 'pass:lab-android')
+        output.chmod(0o600)
+        output.replace(folder / 'client.p12')
+    finally:
+        output.unlink(missing_ok=True)
 
 
 def generate():
@@ -54,10 +76,7 @@ def generate():
             openssl(folder, 'x509', '-req', '-in', f'{name}.csr', '-CA', f'{ca}.crt',
                     '-CAkey', f'{ca}.key', '-set_serial', str(int.from_bytes(os.urandom(16), 'big') or 1),
                     '-days', '7', '-sha256', '-extfile', f'{name}.ext', '-out', f'{name}.crt')
-        # Identidade para importação manual no Android; senha pública de laboratório.
-        openssl(folder, 'pkcs12', '-export', '-inkey', 'client.key', '-in', 'client.crt',
-                '-certfile', 'ca.crt', '-name', 'android-lab', '-out', 'client.p12',
-                '-passout', 'pass:lab-android')
+        export_client(folder)
         for file in folder.iterdir():
             file.chmod(0o600)
         (folder / 'ready').write_text('Certificados locais de laboratório; folhas válidas por 7 dias.\n')
@@ -101,8 +120,9 @@ class Handler(BaseHTTPRequestHandler):
 class Server(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, port):
+    def __init__(self, port, rejected=None):
         self.context = server_context()
+        self.rejected = rejected
         super().__init__(('127.0.0.1', port), Handler)
 
     def get_request(self):
@@ -110,7 +130,9 @@ class Server(ThreadingHTTPServer):
         raw.settimeout(5)
         try:
             return self.context.wrap_socket(raw, server_side=True), address
-        except Exception:
+        except Exception as error:
+            if self.rejected is not None and isinstance(error, ssl.SSLError):
+                self.rejected.put(error)
             raw.close()
             raise
 
@@ -129,7 +151,8 @@ def request(port, context, hostname='localhost'):
 
 
 def test():
-    with Server(0) as server:
+    rejected = queue.Queue()
+    with Server(0, rejected=rejected) as server:
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         try:
@@ -149,6 +172,8 @@ def test():
                  {'CERTIFICATE_VERIFY_FAILED'}),
             ]
             for label, identity, ca, hostname, expected in cases:
+                while not rejected.empty():
+                    rejected.get_nowait()
                 try:
                     request(port, client_context(identity, ca), hostname)
                 except ssl.SSLError as exc:
@@ -158,6 +183,22 @@ def test():
                         raise RuntimeError('A falha não foi por hostname') from exc
                     detail = getattr(exc, 'verify_message', None) or exc.reason
                     print(f'PASSOU: {label} → recusado ({detail})')
+                except (ConnectionResetError, BrokenPipeError):
+                    # Em TLS 1.3, o servidor pode fechar enquanto o cliente envia
+                    # o HTTP. Um reset só prova recusa de certificado se o lado
+                    # servidor registrar a causa de autenticação esperada.
+                    try:
+                        failure = rejected.get(timeout=2)
+                    except queue.Empty:
+                        raise RuntimeError('Conexão encerrada sem evidência de recusa TLS')
+                    missing = (identity is None and
+                               failure.reason == 'PEER_DID_NOT_RETURN_A_CERTIFICATE')
+                    untrusted = (identity == 'other-client' and
+                                 failure.reason == 'CERTIFICATE_VERIFY_FAILED' and
+                                 getattr(failure, 'verify_code', None) in {19, 20, 21})
+                    if not (missing or untrusted):
+                        raise RuntimeError(f'Encerramento inesperado em {label}: {failure}')
+                    print(f'PASSOU: {label} → recusado pelo servidor ({failure.reason})')
                 else:
                     raise RuntimeError(f'Conexão deveria ter sido recusada: {label}')
         finally:
@@ -168,13 +209,16 @@ def test():
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action', choices=['init', 'test', 'serve'])
+    parser.add_argument('action', choices=['init', 'export-client', 'test', 'serve'])
     parser.add_argument('--port', type=int, default=8443)
     args = parser.parse_args()
     os.umask(0o077)
     generate()
     if args.action == 'init':
         print(f'Certificados disponíveis: {STATE}')
+    elif args.action == 'export-client':
+        export_client(STATE)
+        print(f'PKCS12 compatível com Android exportado: {STATE / "client.p12"}')
     elif args.action == 'test':
         test()
     else:

@@ -180,10 +180,43 @@ Abra **Laboratório mTLS** no celular:
    responder HTTP 200.
 
 O Android pode exigir um bloqueio de tela para armazenar a credencial.
+Se a tela pedir o PIN/senha de desbloqueio do aparelho, use a credencial do próprio
+celular; `lab-android` é a senha do arquivo `.p12`.
 Uma resposta válida tem este formato; a versão do TLS depende da negociação:
 
 ```json
 {"mtls": true, "cliente": "android-lab", "tls": "TLSv1.3"}
+```
+
+### Se a importação disser “senha incorreta”
+
+No Redmi Note 8 com Android 10, o importador pode mostrar essa mensagem quando não
+consegue ler o formato PBES2/PBKDF2 usado por padrão pelo OpenSSL 3, mesmo com a senha
+correta. O log do aparelho identifica essa situação como `SecretKeyFactory not available`.
+
+Este projeto exporta o `.p12` com PBE-SHA1-3DES e MAC SHA-1, compatíveis com o importador
+antigo. Essas opções protegem apenas o arquivo de transporte do laboratório; os
+certificados continuam assinados com SHA-256 e o servidor continua usando TLS 1.2 ou
+superior. Veja as [opções de exportação PKCS12 do OpenSSL](https://docs.openssl.org/3.5/man1/openssl-pkcs12/).
+
+Se você gerou o arquivo com uma versão anterior do projeto, reexporte a identidade
+existente e envie novamente ao aparelho:
+
+```bash
+python3 server/lab.py export-client
+adb push .local/certs/client.p12 /sdcard/Download/mtls-client.p12
+```
+
+Cancele a tentativa de importação que já estiver aberta. No app, toque novamente em
+**Importar certificado (.p12)**, selecione o arquivo atualizado e digite `lab-android`.
+O instalador pode manter os bytes antigos em memória até o arquivo ser selecionado
+outra vez. Essa reexportação preserva as chaves, os certificados e suas validades;
+não exige recompilar o APK nem reiniciar o servidor.
+
+Para confirmar a senha e inspecionar o formato no Debian, sem exibir a chave privada:
+
+```bash
+openssl pkcs12 -in .local/certs/client.p12 -info -noout -passin pass:lab-android
 ```
 
 ## 5. Fazer a mesma chamada pelo terminal
@@ -244,6 +277,7 @@ certificados, rotação automática ou operação de um serviço público.
 | Sintoma | O que conferir |
 |---|---|
 | `unauthorized` no ADB | Desbloqueie o aparelho e aceite a depuração USB |
+| “Senha incorreta” ao importar `.p12` | Confira se a tela pede a senha do arquivo ou o PIN do aparelho; para arquivos antigos, siga a seção de reexportação acima |
 | `Connection refused` ou timeout | Servidor iniciado e `adb reverse --list`; erro de rede não prova recusa do certificado |
 | Falha de certificado mesmo com identidade selecionada | CA do APK, certificado do servidor e `.p12` devem pertencer ao mesmo laboratório; confira validade e relógio |
 | `Address already in use` | Outra instância ocupa 8443; identifique-a com `ss -ltnp '( sport = :8443 )'` |

@@ -10,7 +10,7 @@ for executable in python3 openssl keytool; do
     }
 done
 
-python3 "$repo_dir/server/lab.py" init
+python3 "$repo_dir/server/lab.py" export-client
 mkdir -p "$repo_dir/android/app/src/debug/res/raw"
 cp "$repo_dir/.local/certs/ca.crt" "$repo_dir/android/app/src/debug/res/raw/lab_ca.pem"
 
