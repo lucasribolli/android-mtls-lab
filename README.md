@@ -14,7 +14,8 @@ android-mtls-lab/
 ├── README.md
 ├── .gitignore
 ├── server/
-│   └── lab.py                 # Certificados, servidor e testes locais
+│   ├── lab.py                 # Certificados, servidor e testes locais
+│   └── .venv/                 # Ambiente Python local; ignorado pelo Git
 ├── android/
 │   ├── gradlew                # Gradle Wrapper: versão fixa e checksum
 │   ├── gradle/wrapper/
@@ -87,6 +88,31 @@ sdkmanager --licenses
 
 A primeira compilação precisa de internet para obter o Gradle e as dependências.
 As versões foram fixadas conforme a [compatibilidade do AGP 8.9](https://developer.android.com/build/releases/agp-8-9-0-release-notes).
+
+## Ambiente virtual Python
+
+Na raiz do projeto, crie o ambiente dentro de `server/` e ative-o:
+
+```bash
+python3 -m venv server/.venv
+source server/.venv/bin/activate
+python --version
+```
+
+No Debian, se o primeiro comando informar que `ensurepip` não está disponível,
+instale `python3-venv` com o gerenciador de pacotes e repita a criação do ambiente.
+
+O servidor não precisa de pacotes adicionais do pip: usa a biblioteca padrão do Python
+e chama o executável `openssl` do sistema. Em novos terminais, basta repetir o comando
+`source server/.venv/bin/activate`. Para sair do ambiente, execute `deactivate`.
+
+Se já estiver na pasta `server/`, use `source .venv/bin/activate` e inicie com
+`python lab.py serve`. Nesse caso, os logs aparecem no terminal. Para também gravá-los
+em `.local/server.log`, use `../scripts/run-server.sh`.
+
+O script `scripts/run-server.sh` usa diretamente `server/.venv/bin/python`, mesmo sem
+ativar o ambiente no terminal. A pasta `.venv/` é ignorada pelo Git; depois de clonar
+ou mover o projeto para outra máquina, recrie o ambiente com o comando acima.
 
 ## 1. Entender o mTLS sem o celular
 
