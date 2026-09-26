@@ -2,6 +2,7 @@
 """Primeiro laboratório mTLS: Python padrão + OpenSSL, sem pacotes pip."""
 import argparse
 import json
+import logging
 import os
 from pathlib import Path
 import queue
@@ -14,6 +15,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 ROOT = Path(__file__).resolve().parents[1]
 STATE = ROOT / '.local' / 'certs'
+LOG = logging.getLogger('mtls-lab')
 
 
 def openssl(folder, *args):
@@ -113,8 +115,17 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def log_message(self, *_args):
-        pass
+    def log_request(self, code='-', size='-'):
+        cert = self.connection.getpeercert()
+        subject = dict(item for rdn in cert['subject'] for item in rdn)
+        # Registra o caminho, sem query string, cabeçalhos ou corpo da requisição.
+        LOG.info('HTTP_RESPOSTA origem=%s:%s cliente=%r metodo=%s caminho=%r status=%s',
+                 *self.client_address, subject.get('commonName'), self.command,
+                 getattr(self, 'path', '').split('?', 1)[0], code)
+
+    def log_message(self, message, *args):
+        LOG.warning('HTTP_EVENTO origem=%s:%s mensagem=%r',
+                    *self.client_address, message % args)
 
 
 class Server(ThreadingHTTPServer):
@@ -128,11 +139,25 @@ class Server(ThreadingHTTPServer):
     def get_request(self):
         raw, address = self.socket.accept()
         raw.settimeout(5)
+        LOG.info('TCP_ACEITO origem=%s:%s', *address)
         try:
-            return self.context.wrap_socket(raw, server_side=True), address
+            connection = self.context.wrap_socket(raw, server_side=True)
+            cert = connection.getpeercert()
+            subject = dict(item for rdn in cert['subject'] for item in rdn)
+            LOG.info('TLS_OK origem=%s:%s cliente=%r protocolo=%s cifra=%s',
+                     *address, subject.get('commonName'), connection.version(),
+                     connection.cipher()[0])
+            return connection, address
         except Exception as error:
-            if self.rejected is not None and isinstance(error, ssl.SSLError):
-                self.rejected.put(error)
+            if isinstance(error, ssl.SSLError):
+                LOG.warning('TLS_RECUSADO origem=%s:%s motivo=%s detalhe=%r',
+                            *address, error.reason,
+                            getattr(error, 'verify_message', None) or str(error))
+                if self.rejected is not None:
+                    self.rejected.put(error)
+            else:
+                LOG.warning('CONEXAO_FALHOU origem=%s:%s tipo=%s detalhe=%r',
+                            *address, type(error).__name__, str(error))
             raw.close()
             raise
 
@@ -212,6 +237,9 @@ def main():
     parser.add_argument('action', choices=['init', 'export-client', 'test', 'serve'])
     parser.add_argument('--port', type=int, default=8443)
     args = parser.parse_args()
+    logging.basicConfig(level=logging.INFO,
+                        format='%(asctime)s %(levelname)s %(message)s',
+                        datefmt='%Y-%m-%d %H:%M:%S%z')
     os.umask(0o077)
     generate()
     if args.action == 'init':
@@ -223,11 +251,12 @@ def main():
         test()
     else:
         with Server(args.port) as server:
-            print(f'Servidor mTLS em https://localhost:{args.port} — Ctrl+C para parar.', flush=True)
+            LOG.info('SERVIDOR_INICIADO endereco=https://localhost:%s '
+                     'certificado_cliente=obrigatorio', args.port)
             try:
                 server.serve_forever()
             except KeyboardInterrupt:
-                pass
+                LOG.info('SERVIDOR_ENCERRADO motivo=Ctrl+C')
 
 
 if __name__ == '__main__':

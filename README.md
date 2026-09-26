@@ -144,10 +144,40 @@ O script mostra a saída na tela e a acrescenta a `.local/server.log`. Em outro 
 tail -n 50 -f .local/server.log
 ```
 
-Nesta versão, o log registra a inicialização e eventuais erros de execução. Os acessos
-HTTP e as recusas durante a negociação TLS ainda não têm registros próprios;
-o resultado de cada tentativa aparece no app. `Ctrl+C` no `tail` encerra apenas
-a visualização do log.
+Cada linha inclui data, hora e fuso, nível e evento. `Ctrl+C` no `tail` encerra apenas
+a visualização do log; o servidor continua rodando no outro terminal.
+
+| Evento | O que aconteceu |
+|---|---|
+| `SERVIDOR_INICIADO` | A porta está aberta e o servidor exige certificado de cliente |
+| `TCP_ACEITO` | Uma conexão de rede chegou; a identidade ainda não foi validada |
+| `TLS_OK` | O TLS terminou com sucesso; mostra a identidade do cliente, versão e cifra |
+| `HTTP_RESPOSTA` | Uma requisição HTTP chegou depois do TLS; mostra método, caminho e status |
+| `TLS_RECUSADO` | A negociação TLS falhou; o campo `motivo` explica o erro |
+| `CONEXAO_FALHOU` | Houve timeout ou outro problema de conexão; sozinho, isso não comprova uma recusa de certificado |
+| `HTTP_EVENTO` | O servidor HTTP registrou um erro de processamento |
+
+Com o Xiaomi conectado e `adb reverse tcp:8443 tcp:8443` configurado, faça esta prática:
+
+1. Abra o log com `tail -n 50 -f .local/server.log`.
+2. Toque em **Testar sem certificado**. Espere `TCP_ACEITO` e `TLS_RECUSADO`, com
+   `PEER_DID_NOT_RETURN_A_CERTIFICATE`. Não há resposta HTTP: o bloqueio ocorre antes.
+3. Escolha a identidade e toque em **Testar mTLS**. Espere `TCP_ACEITO`, `TLS_OK`
+   com `cliente='android-lab'` e `HTTP_RESPOSTA` com `status=200`.
+
+Exemplo abreviado de sucesso (o arquivo também mostra o horário e a porta de origem):
+
+```text
+INFO TCP_ACEITO origem=127.0.0.1:...
+INFO TLS_OK ... cliente='android-lab' protocolo=TLSv1.3 ...
+INFO HTTP_RESPOSTA ... metodo=GET caminho='/' status=200
+```
+
+As linhas da mesma conexão têm a mesma `origem=IP:porta`. Pelo encaminhamento USB,
+o servidor vê a conexão local do ADB (`127.0.0.1`), não o IP Wi-Fi do Xiaomi.
+Não são registrados chaves privadas, senhas, corpos ou cabeçalhos HTTP; o caminho
+registrado também omite a query string. Os logs não são uma captura das mensagens
+TLS: mostram os eventos observados pelo servidor após descriptografar a conexão.
 
 ## 4. Instalar e conectar o celular
 
