@@ -295,6 +295,7 @@ usar `-k` removeria a verificação do servidor que queremos estudar.
 | Arquivo / trecho | O que observar |
 |---|---|
 | [server/lab.py](server/lab.py) → `generate()` | CA, certificados com usos `serverAuth` e `clientAuth`, SAN `localhost` e PKCS12 |
+| `renew()` e `issue_certificates()` | Renovação das identidades, preservando as CAs e as chaves |
 | `server_context()` | Certificado do servidor, CA aceita para clientes e `ssl.CERT_REQUIRED` |
 | `Server.get_request()` | Negociação TLS antes de qualquer processamento HTTP |
 | `Handler.do_GET()` | Certificado já autenticado e resposta JSON |
@@ -314,8 +315,45 @@ privada do cliente; sua senha `lab-android` é pública e serve apenas ao exerc�
 As chaves PEM locais não têm senha. A CA dura 30 dias e os certificados de servidor
 e cliente duram 7 dias. A chave de assinatura do APK é de depuração.
 
-Para renovar o laboratório, pare o servidor, preserve as credenciais antigas e gere
-outras. Este comando mantém a chave de assinatura do app:
+### Renovar certificados expirados, mantendo a CA
+
+Se aparecer `CERTIFICATE_VERIFY_FAILED: certificate has expired`, confira a validade:
+
+```bash
+openssl x509 -in .local/certs/server.crt -noout -dates
+openssl x509 -in .local/certs/client.crt -noout -dates
+```
+
+O campo `notAfter` indica a expiração em GMT/UTC. O ambiente virtual Python não altera
+essa data. Enquanto as CAs ainda tiverem mais de sete dias de validade, pare o servidor
+e execute, na raiz do projeto:
+
+```bash
+server/.venv/bin/python server/lab.py renew
+server/.venv/bin/python server/lab.py test
+```
+
+Se estiver dentro de `server/` com o ambiente ativado, os comandos são `python lab.py renew`
+e `python lab.py test`. A renovação emite novos certificados de servidor e clientes por
+sete dias, preserva as CAs e as chaves privadas e reexporta o `.p12` compatível com Android.
+O estado anterior fica salvo em `.local/certs-before-renew-<data>/`, fora do Git.
+
+Inicie novamente o servidor com `./scripts/run-server.sh`. Para testar no Xiaomi,
+atualize a identidade instalada, pois o Android ainda guarda o certificado antigo:
+
+```bash
+adb push .local/certs/client.p12 /sdcard/Download/mtls-client.p12
+```
+
+No app, importe o arquivo atualizado usando `lab-android` e escolha essa identidade
+novamente. Se o Android pedir confirmação para substituir a identidade anterior,
+confirme a substituição. A CA continua a mesma, portanto o APK não precisa ser recompilado.
+A validação dos certificados permanece ativa.
+
+### Criar uma nova CA
+
+Se a CA também expirou ou tem menos de sete dias restantes, pare o servidor e gere um
+novo laboratório. Este comando mantém a chave de assinatura do app:
 
 ```bash
 mv .local/certs ".local/certs-anteriores-$(date +%Y%m%d-%H%M%S)"
@@ -325,8 +363,8 @@ mv .local/certs ".local/certs-anteriores-$(date +%Y%m%d-%H%M%S)"
 Depois reinicie o servidor, reinstale o APK, transfira o novo `.p12`, importe-o e
 selecione a nova identidade. Uma CA nova não funciona com o APK ou a identidade antigos.
 
-Este é um laboratório local: não implementa gestão de usuários, revogação de
-certificados, rotação automática ou operação de um serviço público.
+Este é um laboratório local: a renovação é manual. Ele não implementa gestão de usuários,
+revogação de certificados, rotação automática ou operação de um serviço público.
 
 ## Problemas comuns
 
@@ -336,6 +374,7 @@ certificados, rotação automática ou operação de um serviço público.
 | “Senha incorreta” ao importar `.p12` | Confira se a tela pede a senha do arquivo ou o PIN do aparelho; para arquivos antigos, siga a seção de reexportação acima |
 | `Connection refused` ou timeout | Servidor iniciado e `adb reverse --list`; erro de rede não prova recusa do certificado |
 | Falha de certificado mesmo com identidade selecionada | CA do APK, certificado do servidor e `.p12` devem pertencer ao mesmo laboratório; confira validade e relógio |
+| `certificate has expired` | Renove com `python lab.py renew` dentro de `server/`, reinicie o servidor e importe o novo `.p12` no Android |
 | `Address already in use` | Outra instância ocupa 8443; identifique-a com `ss -ltnp '( sport = :8443 )'` |
 | `SDK location not found` | Ajuste `ANDROID_HOME` ou o SDK em `android/local.properties` |
 | Erro de Java no Gradle | Confira `java -version`, `JAVA_HOME` e o Gradle JDK da IDE |

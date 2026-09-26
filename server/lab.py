@@ -1,11 +1,13 @@
 #!/usr/bin/env python3
 """Primeiro laboratório mTLS: Python padrão + OpenSSL, sem pacotes pip."""
 import argparse
+from datetime import datetime, timezone
 import json
 import logging
 import os
 from pathlib import Path
 import queue
+import shutil
 import socket
 import ssl
 import subprocess
@@ -45,6 +47,29 @@ def export_client(folder):
         output.unlink(missing_ok=True)
 
 
+def issue_certificates(folder, reuse_keys=False):
+    """Emite as três identidades do laboratório com validade de sete dias."""
+    for name, ca, purpose, cn in [
+        ('server', 'ca', 'serverAuth', 'localhost'),
+        ('client', 'ca', 'clientAuth', 'android-lab'),
+        ('other-client', 'other-ca', 'clientAuth', 'untrusted-client'),
+    ]:
+        key_options = (['-key', f'{name}.key'] if reuse_keys else
+                       ['-newkey', 'rsa:2048', '-noenc', '-keyout', f'{name}.key'])
+        openssl(folder, 'req', '-new', *key_options,
+                '-subj', f'/CN={cn}', '-out', f'{name}.csr')
+        extensions = ('basicConstraints=critical,CA:FALSE\n'
+                      'keyUsage=critical,digitalSignature,keyEncipherment\n'
+                      f'extendedKeyUsage={purpose}\n'
+                      'subjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid,issuer\n')
+        if name == 'server':
+            extensions += 'subjectAltName=DNS:localhost,IP:127.0.0.1\n'
+        (folder / f'{name}.ext').write_text(extensions)
+        openssl(folder, 'x509', '-req', '-in', f'{name}.csr', '-CA', f'{ca}.crt',
+                '-CAkey', f'{ca}.key', '-set_serial', str(int.from_bytes(os.urandom(16), 'big') or 1),
+                '-days', '7', '-sha256', '-extfile', f'{name}.ext', '-out', f'{name}.crt')
+
+
 def generate():
     """Cria uma CA do laboratório, servidor, cliente e cliente de uma outra CA."""
     if (STATE / 'ready').is_file():
@@ -61,29 +86,52 @@ def generate():
                     '-addext', 'basicConstraints=critical,CA:TRUE,pathlen:0',
                     '-addext', 'keyUsage=critical,keyCertSign,cRLSign',
                     '-addext', 'subjectKeyIdentifier=hash')
-        for name, ca, purpose, cn in [
-            ('server', 'ca', 'serverAuth', 'localhost'),
-            ('client', 'ca', 'clientAuth', 'android-lab'),
-            ('other-client', 'other-ca', 'clientAuth', 'untrusted-client'),
-        ]:
-            openssl(folder, 'req', '-new', '-newkey', 'rsa:2048', '-noenc',
-                    '-subj', f'/CN={cn}', '-keyout', f'{name}.key', '-out', f'{name}.csr')
-            extensions = ('basicConstraints=critical,CA:FALSE\n'
-                          'keyUsage=critical,digitalSignature,keyEncipherment\n'
-                          f'extendedKeyUsage={purpose}\n'
-                          'subjectKeyIdentifier=hash\nauthorityKeyIdentifier=keyid,issuer\n')
-            if name == 'server':
-                extensions += 'subjectAltName=DNS:localhost,IP:127.0.0.1\n'
-            (folder / f'{name}.ext').write_text(extensions)
-            openssl(folder, 'x509', '-req', '-in', f'{name}.csr', '-CA', f'{ca}.crt',
-                    '-CAkey', f'{ca}.key', '-set_serial', str(int.from_bytes(os.urandom(16), 'big') or 1),
-                    '-days', '7', '-sha256', '-extfile', f'{name}.ext', '-out', f'{name}.crt')
+        issue_certificates(folder)
         export_client(folder)
         for file in folder.iterdir():
             file.chmod(0o600)
         (folder / 'ready').write_text('Certificados locais de laboratório; folhas válidas por 7 dias.\n')
         folder.rename(STATE)
     print(f'Certificados de laboratório criados em {STATE}', flush=True)
+
+
+def renew():
+    """Renova as folhas e o PKCS12, preservando as CAs e todas as chaves privadas."""
+    for ca in ['ca', 'other-ca']:
+        openssl(STATE, 'verify', '-CAfile', f'{ca}.crt', f'{ca}.crt')
+        check = subprocess.run(['openssl', 'x509', '-in', str(STATE / f'{ca}.crt'),
+                                '-checkend', str(7 * 86400), '-noout'],
+                               capture_output=True, text=True)
+        if check.returncode:
+            raise RuntimeError(f'{ca}.crt precisa ter mais de sete dias de validade. '
+                               'Consulte no README como gerar uma nova CA e reinstalar o app.')
+
+    # Prepara e verifica tudo antes de substituir o diretório usado pelo laboratório.
+    with tempfile.TemporaryDirectory(prefix='mtls-renew-', dir=STATE.parent) as temp:
+        folder = Path(temp) / 'certs'
+        shutil.copytree(STATE, folder)
+        issue_certificates(folder, reuse_keys=True)
+        for name, ca, purpose in [('server', 'ca', 'sslserver'),
+                                  ('client', 'ca', 'sslclient'),
+                                  ('other-client', 'other-ca', 'sslclient')]:
+            openssl(folder, 'verify', '-CAfile', f'{ca}.crt',
+                    '-purpose', purpose, f'{name}.crt')
+        export_client(folder)
+        for file in folder.iterdir():
+            if file.is_file():
+                file.chmod(0o600)
+        folder.chmod(0o700)
+        timestamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S%fZ')
+        backup = STATE.with_name(f'certs-before-renew-{timestamp}')
+        STATE.rename(backup)
+        try:
+            folder.rename(STATE)
+        except Exception:
+            backup.rename(STATE)
+            raise
+    print(f'Certificados renovados por sete dias. Backup: {backup}', flush=True)
+    print('Reinicie o servidor e importe novamente client.p12 no Android. '
+          'A CA e as chaves foram preservadas; não é necessário recompilar o APK.', flush=True)
 
 
 def server_context():
@@ -234,7 +282,7 @@ def test():
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action', choices=['init', 'export-client', 'test', 'serve'])
+    parser.add_argument('action', choices=['init', 'renew', 'export-client', 'test', 'serve'])
     parser.add_argument('--port', type=int, default=8443)
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO,
@@ -244,6 +292,8 @@ def main():
     generate()
     if args.action == 'init':
         print(f'Certificados disponíveis: {STATE}')
+    elif args.action == 'renew':
+        renew()
     elif args.action == 'export-client':
         export_client(STATE)
         print(f'PKCS12 compatível com Android exportado: {STATE / "client.p12"}')
