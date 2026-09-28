@@ -1,43 +1,29 @@
 package lab.mtls;
 
 import android.app.Activity;
-import android.content.Intent;
 import android.os.Bundle;
-import android.security.KeyChain;
+import android.text.InputType;
 import android.widget.Button;
+import android.widget.EditText;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
 import android.widget.TextView;
-import java.io.ByteArrayOutputStream;
-import java.io.InputStream;
-import java.net.Socket;
-import java.net.URL;
-import java.nio.charset.StandardCharsets;
-import java.security.Principal;
-import java.security.PrivateKey;
-import java.security.cert.X509Certificate;
+import java.util.ArrayList;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import javax.net.ssl.HttpsURLConnection;
-import javax.net.ssl.KeyManager;
-import javax.net.ssl.SSLContext;
-import javax.net.ssl.SSLEngine;
-import javax.net.ssl.X509ExtendedKeyManager;
 
-/** App didático: chave privada escolhida pelo usuário no KeyChain do Android. */
+/** App comum: somente INTERNET. Chave da instalação criada no Android Keystore. */
 public final class MainActivity extends Activity {
-    private static final int PICK_PKCS12 = 100;
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
-    private String alias;
-    private TextView identity;
+    private final ArrayList<Button> buttons = new ArrayList<>();
+    private TextView identityView;
     private TextView result;
-    private Button withCert;
-    private Button withoutCert;
+    private EditText token;
+    private Button enroll;
 
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
-        if (state != null) alias = state.getString("alias");
-        int padding = (int) (20 * getResources().getDisplayMetrics().density);
+        int padding = (int) (18 * getResources().getDisplayMetrics().density);
         LinearLayout content = new LinearLayout(this);
         content.setOrientation(LinearLayout.VERTICAL);
         content.setPadding(padding, padding, padding, padding);
@@ -46,187 +32,104 @@ public final class MainActivity extends Activity {
                     padding, padding + insets.getSystemWindowInsetBottom());
             return insets;
         });
-        TextView title = text("mTLS: confiança nos dois sentidos", 24);
-        content.addView(title);
-        content.addView(text("Servidor: https://localhost:8443\n"
-                + "Primeiro importe client.p12. Depois escolha o certificado e compare os dois testes. "
-                + "O servidor exige uma identidade válida do cliente.", 16));
-        Button install = button("1. Importar certificado (.p12)");
-        install.setOnClickListener(view -> {
-            Intent intent = new Intent(Intent.ACTION_OPEN_DOCUMENT);
-            intent.setType("*/*");
-            intent.addCategory(Intent.CATEGORY_OPENABLE);
-            startActivityForResult(intent, PICK_PKCS12);
+        content.addView(text("Banco Lab · identidade no aparelho", 23));
+        content.addView(text("A chave privada é gerada nesta instalação. O cadastro usa HTTPS; "
+                + "o acesso à conta exige mTLS. O token representa uma autorização prévia do banco.", 16));
+        identityView = text("Carregando identidade…", 14);
+        identityView.setTextIsSelectable(true);
+        content.addView(identityView);
+        addButton(content, "1. Gerar chave no aparelho", () -> {
+            new BankIdentity().ensureKey();
+            return "Chave pronta. O certificado local é provisório até o cadastro no banco.";
         });
-        content.addView(install);
-        Button choose = button("2. Escolher identidade");
-        choose.setOnClickListener(view -> KeyChain.choosePrivateKeyAlias(this,
-                selected -> runOnUiThread(() -> {
-                    alias = selected;
-                    showIdentity();
-                }), new String[]{"RSA", "EC"}, null, "localhost", 8443, alias));
-        content.addView(choose);
-        identity = text("", 16);
-        showIdentity();
-        content.addView(identity);
-        withoutCert = button("3. Testar sem certificado: deve falhar");
-        withoutCert.setOnClickListener(view -> test(false));
-        content.addView(withoutCert);
-        withCert = button("4. Testar mTLS: deve funcionar");
-        withCert.setOnClickListener(view -> test(true));
-        content.addView(withCert);
-        result = text("Aguardando teste. O servidor precisa estar iniciado no Debian e a porta "
-                + "8443 encaminhada pelo ADB.", 16);
+        token = new EditText(this);
+        token.setHint("Token de cadastro (gerado no servidor)");
+        token.setSingleLine(true);
+        token.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD);
+        token.setSaveEnabled(false);
+        token.setImportantForAutofill(android.view.View.IMPORTANT_FOR_AUTOFILL_NO);
+        content.addView(token);
+        enroll = new Button(this);
+        enroll.setText("2. Cadastrar identidade por HTTPS");
+        enroll.setAllCaps(false);
+        enroll.setOnClickListener(view -> {
+            String value = token.getText().toString().trim();
+            token.setText("");
+            execute(() -> {
+                BankApi.enroll(new BankIdentity(), value);
+                return "Cadastro concluído. O certificado do banco foi associado à chave local. "
+                        + "Agora acesse a conta por mTLS.";
+            });
+        });
+        buttons.add(enroll);
+        content.addView(enroll);
+        addButton(content, "3. Acessar conta por mTLS", () -> BankApi.account(new BankIdentity()).toString(2));
+        addButton(content, "Teste: acessar sem identidade", () -> {
+            BankApi.account(null);
+            return "ERRO: o servidor aceitou acesso sem certificado.";
+        });
+        result = text("O servidor precisa estar ativo. Cadastro: porta 8444. API: porta 8443.", 15);
         result.setTextIsSelectable(true);
         content.addView(result);
         ScrollView scroll = new ScrollView(this);
         scroll.setFillViewport(true);
         scroll.addView(content);
         setContentView(scroll);
+        execute(() -> "Use os passos acima. Nenhum arquivo .p12 é necessário.");
     }
 
     private TextView text(String value, int size) {
         TextView view = new TextView(this);
         view.setText(value);
         view.setTextSize(size);
-        view.setPadding(0, 12, 0, 20);
+        view.setPadding(0, 10, 0, 16);
         return view;
     }
 
-    private Button button(String label) {
-        Button view = new Button(this);
-        view.setText(label);
-        view.setAllCaps(false);
-        return view;
+    private void addButton(LinearLayout content, String label, Action action) {
+        Button button = new Button(this);
+        button.setText(label);
+        button.setAllCaps(false);
+        button.setOnClickListener(view -> execute(action));
+        buttons.add(button);
+        content.addView(button);
     }
 
-    private void showIdentity() {
-        identity.setText(alias == null ? "Nenhuma identidade selecionada." : "Identidade: " + alias);
-    }
+    private interface Action { String run() throws Exception; }
 
-    @Override protected void onSaveInstanceState(Bundle state) {
-        super.onSaveInstanceState(state);
-        state.putString("alias", alias);
-    }
-
-    @Override protected void onActivityResult(int request, int code, Intent data) {
-        super.onActivityResult(request, code, data);
-        if (request != PICK_PKCS12 || code != RESULT_OK || data == null || data.getData() == null) return;
+    private void execute(Action action) {
+        for (Button button : buttons) button.setEnabled(false);
+        result.setText("Executando…");
         worker.execute(() -> {
-            try (InputStream stream = getContentResolver().openInputStream(data.getData())) {
-                byte[] bundle = readBounded(stream, 1024 * 1024);
-                runOnUiThread(() -> {
-                    Intent install = KeyChain.createInstallIntent();
-                    install.putExtra(KeyChain.EXTRA_PKCS12, bundle);
-                    install.putExtra(KeyChain.EXTRA_NAME, "android-lab");
-                    startActivity(install);
-                    result.setText("Conclua a importação na tela do Android. Senha do laboratório: "
-                            + "lab-android. Depois toque em Escolher identidade.");
-                });
-            } catch (Exception error) {
-                showResult("Falha na importação: " + error.getMessage());
+            String message;
+            String description = "Identidade indisponível.";
+            boolean registered = false;
+            try { message = action.run(); }
+            catch (Exception error) {
+                message = error.getClass().getSimpleName() + ": " + error.getMessage()
+                        + "\nFalhas de rede não comprovam recusa de certificado; confira os logs do servidor.";
             }
-        });
-    }
-
-    private static byte[] readBounded(InputStream stream, int limit) throws Exception {
-        if (stream == null) throw new IllegalArgumentException("Arquivo indisponível");
-        ByteArrayOutputStream bytes = new ByteArrayOutputStream();
-        byte[] buffer = new byte[4096];
-        int count;
-        while ((count = stream.read(buffer)) != -1) {
-            if (bytes.size() + count > limit) throw new IllegalArgumentException("Conteúdo grande demais");
-            bytes.write(buffer, 0, count);
-        }
-        return bytes.toByteArray();
-    }
-
-    private void test(boolean authenticated) {
-        String chosen = alias;
-        if (authenticated && chosen == null) {
-            result.setText("Escolha a identidade antes de testar mTLS.");
-            return;
-        }
-        withCert.setEnabled(false);
-        withoutCert.setEnabled(false);
-        result.setText("Conectando…");
-        worker.execute(() -> {
-            HttpsURLConnection connection = null;
             try {
-                KeyManager[] managers = new KeyManager[0];
-                if (authenticated) {
-                    PrivateKey key = KeyChain.getPrivateKey(this, chosen);
-                    X509Certificate[] chain = KeyChain.getCertificateChain(this, chosen);
-                    if (key == null || chain == null || chain.length == 0)
-                        throw new IllegalStateException("Identidade indisponível. Selecione novamente.");
-                    managers = new KeyManager[]{new ClientIdentity(chosen, key, chain)};
-                }
-                SSLContext context = SSLContext.getInstance("TLS");
-                // TrustManager padrão: respeita a configuração de confiança do app.
-                context.init(managers, null, null);
-                connection = (HttpsURLConnection) new URL("https://localhost:8443/").openConnection();
-                connection.setSSLSocketFactory(context.getSocketFactory());
-                // A verificação padrão de hostname permanece ativa.
-                connection.setConnectTimeout(5000);
-                connection.setReadTimeout(8000);
-                connection.setRequestProperty("Connection", "close");
-                int status = connection.getResponseCode();
-                String body;
-                try (InputStream stream = status < 400 ? connection.getInputStream() : connection.getErrorStream()) {
-                    body = new String(readBounded(stream, 65536), StandardCharsets.UTF_8);
-                }
-                showResult("HTTP " + status + "\n" + body);
-            } catch (Exception error) {
-                showResult((authenticated ? "Falha no mTLS" : "Conexão sem certificado falhou")
-                        + "\n" + error.getClass().getSimpleName() + ": " + error.getMessage()
-                        + "\n\nSe aparecer conexão recusada ou tempo esgotado, confira o servidor e o ADB. "
-                        + "Esses erros de rede, sozinhos, não comprovam uma recusa de certificado.");
-            } finally {
-                if (connection != null) connection.disconnect();
-                runOnUiThread(() -> {
-                    withCert.setEnabled(true);
-                    withoutCert.setEnabled(true);
-                });
-            }
+                BankIdentity identity = new BankIdentity();
+                description = identity.description();
+                registered = identity.enrolled();
+            } catch (Exception error) { description = error.toString(); }
+            String finalMessage = message;
+            String finalDescription = description;
+            boolean finalRegistered = registered;
+            runOnUiThread(() -> {
+                if (isDestroyed()) return;
+                result.setText(finalMessage);
+                identityView.setText(finalDescription);
+                for (Button button : buttons) button.setEnabled(true);
+                enroll.setEnabled(!finalRegistered);
+                token.setEnabled(!finalRegistered);
+            });
         });
-    }
-
-    private void showResult(String message) {
-        runOnUiThread(() -> { if (!isDestroyed()) result.setText(message); });
     }
 
     @Override protected void onDestroy() {
         worker.shutdownNow();
         super.onDestroy();
-    }
-
-    private static final class ClientIdentity extends X509ExtendedKeyManager {
-        private final String alias;
-        private final PrivateKey key;
-        private final X509Certificate[] chain;
-        ClientIdentity(String alias, PrivateKey key, X509Certificate[] chain) {
-            this.alias = alias;
-            this.key = key;
-            this.chain = chain.clone();
-        }
-        private boolean supports(String type) { return key.getAlgorithm().equalsIgnoreCase(type); }
-        @Override public String[] getClientAliases(String type, Principal[] issuers) {
-            return supports(type) ? new String[]{alias} : null;
-        }
-        @Override public String chooseClientAlias(String[] types, Principal[] issuers, Socket socket) {
-            if (types != null) for (String type : types) if (supports(type)) return alias;
-            return null;
-        }
-        @Override public String chooseEngineClientAlias(String[] types, Principal[] issuers, SSLEngine engine) {
-            return chooseClientAlias(types, issuers, null);
-        }
-        @Override public X509Certificate[] getCertificateChain(String requested) {
-            return alias.equals(requested) ? chain.clone() : null;
-        }
-        @Override public PrivateKey getPrivateKey(String requested) {
-            return alias.equals(requested) ? key : null;
-        }
-        @Override public String[] getServerAliases(String type, Principal[] issuers) { return null; }
-        @Override public String chooseServerAlias(String type, Principal[] issuers, Socket socket) { return null; }
     }
 }

@@ -3,16 +3,17 @@ set -euo pipefail
 umask 077
 repo_dir="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd)"
 
-for executable in python3 openssl keytool; do
+for executable in keytool; do
     command -v "$executable" >/dev/null || {
         printf 'Comando ausente: %s. Veja os pré-requisitos no README.\n' "$executable" >&2
         exit 1
     }
 done
 
-python3 "$repo_dir/server/lab.py" export-client
+"$repo_dir/scripts/setup-server.sh"
+"$repo_dir/server/.venv/bin/python" "$repo_dir/server/lab.py" init
 mkdir -p "$repo_dir/android/app/src/debug/res/raw"
-cp "$repo_dir/.local/certs/ca.crt" "$repo_dir/android/app/src/debug/res/raw/lab_ca.pem"
+cp "$repo_dir/.local/bank/ca.crt" "$repo_dir/android/app/src/debug/res/raw/lab_ca.pem"
 
 if [[ ! -f "$repo_dir/.local/debug.keystore" ]]; then
     keytool -genkeypair -keystore "$repo_dir/.local/debug.keystore" \
