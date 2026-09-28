@@ -1,8 +1,10 @@
 package lab.mtls;
 
+import android.content.Context;
 import android.security.keystore.KeyGenParameterSpec;
 import android.security.keystore.KeyInfo;
 import android.security.keystore.KeyProperties;
+import android.util.Base64;
 import java.io.ByteArrayInputStream;
 import java.nio.charset.StandardCharsets;
 import java.security.KeyFactory;
@@ -14,26 +16,39 @@ import java.security.cert.CertificateFactory;
 import java.security.cert.X509Certificate;
 import java.util.Arrays;
 import java.util.Date;
+import java.util.UUID;
 import javax.security.auth.x500.X500Principal;
+import org.json.JSONArray;
 
-/** Credencial privada desta instalação. Não usa KeyChain nem permissões de administrador. */
+/** Chave da instalação, acessível somente pelo UID do app. Não usa KeyChain. */
 final class BankIdentity {
-    static final String ALIAS = "bank-client";
+    private static final String PREFS = "bank-v3";
+    final String alias;
     private final KeyStore store;
+    private final Context context;
 
-    BankIdentity() throws Exception {
+    private BankIdentity(Context context, String alias) throws Exception {
+        this.context = context.getApplicationContext();
+        this.alias = alias;
         store = KeyStore.getInstance("AndroidKeyStore");
         store.load(null);
     }
 
-    void ensureKey() throws Exception {
-        if (store.containsAlias(ALIAS)) return;
+    static BankIdentity active(Context context) throws Exception {
+        String alias = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString("active", null);
+        return alias == null ? null : new BankIdentity(context, alias);
+    }
+
+    static BankIdentity generate(Context context, byte[] challenge) throws Exception {
+        if (challenge.length != 32) throw new IllegalArgumentException("Challenge deve ter 32 bytes.");
+        BankIdentity identity = new BankIdentity(context, "bank-attested-" + UUID.randomUUID());
         KeyPairGenerator generator = KeyPairGenerator.getInstance("RSA", "AndroidKeyStore");
-        generator.initialize(new KeyGenParameterSpec.Builder(ALIAS, KeyProperties.PURPOSE_SIGN)
+        generator.initialize(new KeyGenParameterSpec.Builder(identity.alias, KeyProperties.PURPOSE_SIGN)
                 .setKeySize(2048)
-                // Conscrypt prepara digest/padding no TLS: autoriza a operação RSA
-                // interna sem processá-los novamente (KeyGenParameterSpec.Builder).
-                .setDigests(KeyProperties.DIGEST_NONE, KeyProperties.DIGEST_SHA256, KeyProperties.DIGEST_SHA384, KeyProperties.DIGEST_SHA512)
+                .setAttestationChallenge(challenge)
+                // Conscrypt/Android 10 prepara o digest e o padding antes da operação privada.
+                .setDigests(KeyProperties.DIGEST_NONE, KeyProperties.DIGEST_SHA256,
+                            KeyProperties.DIGEST_SHA384, KeyProperties.DIGEST_SHA512)
                 .setEncryptionPaddings(KeyProperties.ENCRYPTION_PADDING_NONE)
                 .setSignaturePaddings(KeyProperties.SIGNATURE_PADDING_RSA_PKCS1,
                                       KeyProperties.SIGNATURE_PADDING_RSA_PSS)
@@ -41,17 +56,27 @@ final class BankIdentity {
                 .setCertificateNotBefore(new Date(System.currentTimeMillis() - 60000))
                 .setCertificateNotAfter(new Date(System.currentTimeMillis() + 365L * 86400000))
                 .build());
-        generator.generateKeyPair(); // O certificado local é provisório, sem confiança do banco.
+        generator.generateKeyPair();
+        return identity;
     }
 
     PrivateKey privateKey() throws Exception {
-        return (PrivateKey) store.getKey(ALIAS, null); // Referência ao Keystore, não bytes da chave.
+        return (PrivateKey) store.getKey(alias, null); // Referência opaca, nunca bytes privados.
     }
 
     X509Certificate[] chain() throws Exception {
-        Certificate[] chain = store.getCertificateChain(ALIAS);
-        if (chain == null) return new X509Certificate[0];
-        return Arrays.copyOf(chain, chain.length, X509Certificate[].class);
+        Certificate[] chain = store.getCertificateChain(alias);
+        return chain == null ? new X509Certificate[0] : Arrays.copyOf(chain, chain.length, X509Certificate[].class);
+    }
+
+    JSONArray attestationChain() throws Exception {
+        JSONArray result = new JSONArray();
+        for (X509Certificate certificate : chain()) {
+            result.put("-----BEGIN CERTIFICATE-----\n"
+                    + Base64.encodeToString(certificate.getEncoded(), Base64.NO_WRAP)
+                    + "\n-----END CERTIFICATE-----\n");
+        }
+        return result;
     }
 
     boolean enrolled() throws Exception {
@@ -63,10 +88,7 @@ final class BankIdentity {
                 && certs[0].getExtendedKeyUsage().contains("1.3.6.1.5.5.7.3.2");
     }
 
-    String csr() throws Exception {
-        ensureKey();
-        return Pkcs10.create(chain()[0].getPublicKey(), privateKey());
-    }
+    String csr() throws Exception { return Pkcs10.create(chain()[0].getPublicKey(), privateKey()); }
 
     void install(String certificatePem, String caPem) throws Exception {
         X509Certificate certificate = parse(certificatePem);
@@ -80,20 +102,29 @@ final class BankIdentity {
                 || !certificate.getExtendedKeyUsage().contains("1.3.6.1.5.5.7.3.2")
                 || certificate.getKeyUsage() == null || !certificate.getKeyUsage()[0]
                 || !Arrays.equals(certificate.getPublicKey().getEncoded(), chain()[0].getPublicKey().getEncoded()))
-            throw new IllegalArgumentException("Certificado incompatível com a chave ou com clientAuth.");
-        // CA recebida pelo endpoint HTTPS autenticado do banco. Só substitui a cadeia pública.
-        store.setKeyEntry(ALIAS, privateKey(), null, new Certificate[]{certificate, ca});
+            throw new IllegalArgumentException("Certificado incompatível com a chave ou clientAuth.");
+        // Só a cadeia pública é substituída. A chave continua no Keystore.
+        store.setKeyEntry(alias, privateKey(), null, new Certificate[]{certificate, ca});
+    }
+
+    void activate() throws Exception {
+        if (!enrolled()) throw new IllegalStateException("Instale o certificado do banco primeiro.");
+        if (!context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).edit().putString("active", alias).commit())
+            throw new java.io.IOException("Não foi possível persistir o alias ativo.");
+    }
+
+    void discardPending() throws Exception {
+        String active = context.getSharedPreferences(PREFS, Context.MODE_PRIVATE).getString("active", null);
+        if (!alias.equals(active)) store.deleteEntry(alias);
     }
 
     String description() throws Exception {
-        if (!store.containsAlias(ALIAS)) return "Nenhuma chave criada nesta instalação.";
-        KeyInfo info = KeyFactory.getInstance("RSA", "AndroidKeyStore")
-                .getKeySpec(privateKey(), KeyInfo.class);
-        String state = enrolled() ? "Identidade cadastrada\n" + chain()[0].getSubjectX500Principal()
-                + "\nVálida até: " + chain()[0].getNotAfter() : "Chave local pronta; cadastro necessário.";
-        return state + "\nChave exportável pela API: " + (privateKey().getEncoded() != null)
-                + "\nHardware segundo o Android: " + info.isInsideSecureHardware()
-                + "\nEssa informação local não é atestação para o banco.";
+        KeyInfo info = KeyFactory.getInstance("RSA", "AndroidKeyStore").getKeySpec(privateKey(), KeyInfo.class);
+        return (enrolled() ? "Identidade mTLS cadastrada" : "Certificado expirado: novo cadastro necessário")
+                + "\n" + chain()[0].getSubjectX500Principal()
+                + "\nValidade: " + chain()[0].getNotAfter()
+                + "\nChave exportável pela API: " + (privateKey().getEncoded() != null)
+                + "\nHardware informado localmente: " + info.isInsideSecureHardware();
     }
 
     private static X509Certificate parse(String pem) throws Exception {

@@ -20,4 +20,23 @@ if [[ ! -f "$repo_dir/.local/debug.keystore" ]]; then
         -storepass android -keypass android -alias androiddebugkey -keyalg RSA \
         -keysize 2048 -validity 365 -dname 'CN=Android Debug,O=MTLS Lab,C=BR'
 fi
+"$repo_dir/server/.venv/bin/python" - "$repo_dir" <<'PY'
+import json
+from pathlib import Path
+import subprocess
+import sys
+from cryptography import x509
+from cryptography.hazmat.primitives import hashes
+
+root = Path(sys.argv[1])
+public = subprocess.run(['keytool', '-exportcert', '-keystore', str(root / '.local/debug.keystore'),
+                         '-storepass', 'android', '-alias', 'androiddebugkey'],
+                        check=True, capture_output=True).stdout
+fingerprint = x509.load_der_x509_certificate(public).fingerprint(hashes.SHA256()).hex()
+policy = root / '.local/bank/attestation-policy.json'
+policy.write_text(json.dumps({'package_name': 'lab.mtls', 'min_version': 3,
+                              'signing_digests': [fingerprint]}, indent=2) + '\n')
+policy.chmod(0o600)
+print('Política de atestação vinculada à assinatura deste APK de debug.')
+PY
 printf 'Laboratório preparado. Credenciais em .local/; CA pública no app de depuração.\n'

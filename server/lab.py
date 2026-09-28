@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""Cadastro HTTPS + API mTLS com identidade gerada no Android Keystore."""
+"""Banco Lab: login/MFA, atestação Google, sessão e renovação por mTLS."""
 import argparse
 from contextlib import ExitStack, closing
 from datetime import datetime, timedelta, timezone
-import hashlib
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import logging
@@ -23,11 +22,16 @@ from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.x509.oid import ExtendedKeyUsageOID, NameOID, SignatureAlgorithmOID
 
+import auth
+from attestation import GoogleAttestation
+
 ROOT = Path(__file__).resolve().parents[1]
 STATE = ROOT / '.local' / 'bank'
 LOG = logging.getLogger('mtls-lab')
 PEM = serialization.Encoding.PEM
-MAX_BODY = 16384
+MAX_BODY = 131072
+
+EnrollmentError = auth.Error
 
 
 def now():
@@ -117,6 +121,21 @@ def initialize(state):
                 id TEXT PRIMARY KEY, account TEXT NOT NULL, fingerprint TEXT UNIQUE NOT NULL,
                 certificate TEXT NOT NULL, active INTEGER NOT NULL DEFAULT 1);
         ''')
+        # Preserva o histórico v2. Identidades antigas não se tornam atestadas por migração.
+        columns = {row[1] for row in db.execute('PRAGMA table_info(devices)')}
+        for name, kind in [('attested', 'INTEGER NOT NULL DEFAULT 0'),
+                           ('attestation_chain', 'TEXT'), ('attestation_result', 'TEXT'),
+                           ('attested_at', 'REAL')]:
+            if name not in columns:
+                db.execute(f'ALTER TABLE devices ADD COLUMN {name} {kind}')
+        db.executescript('''
+            CREATE TABLE IF NOT EXISTS client_certificates (
+                fingerprint TEXT PRIMARY KEY, device_id TEXT NOT NULL, certificate TEXT NOT NULL,
+                accept_until REAL NOT NULL);
+            CREATE TABLE IF NOT EXISTS renewals (
+                old_fingerprint TEXT PRIMARY KEY, new_fingerprint TEXT NOT NULL);
+        ''')
+    auth.initialize(state)
     (state / 'bank.db').chmod(0o600)
 
 
@@ -126,67 +145,112 @@ def database(state):
     return db
 
 
-def new_token(state, account, ttl=600):
-    if not re.fullmatch(r'[A-Za-z0-9_.@-]{1,80}', account):
-        raise ValueError('Conta: use de 1 a 80 letras ASCII, números, _, ., @ ou -.')
-    if not 1 <= ttl <= 900:
-        raise ValueError('Validade do token deve estar entre 1 e 900 segundos.')
-    token = secrets.token_urlsafe(24)
-    with closing(database(state)) as db, db:
-        db.execute('INSERT INTO tokens(digest,account,expires) VALUES (?,?,?)',
-                   (hashlib.sha256(token.encode()).hexdigest(), account, time.time() + ttl))
-    return token
-
-
-class EnrollmentError(Exception):
-    def __init__(self, status, message):
-        super().__init__(message)
-        self.status = status
-
-
-def enroll(state, token, csr_pem):
-    if not re.fullmatch(r'[A-Za-z0-9_-]{32}', token):
-        raise EnrollmentError(401, 'Token ausente, inválido ou expirado.')
-    if not isinstance(csr_pem, str) or len(csr_pem) > MAX_BODY:
+def public_csr(csr_pem):
+    if not isinstance(csr_pem, str) or len(csr_pem) > 8192:
         raise EnrollmentError(400, 'CSR inválido.')
-    digest = hashlib.sha256(csr_pem.encode()).hexdigest()
-    # A transação serializa consumo do token e emissão. Repetir o mesmo pedido
-    # recupera o mesmo certificado se a resposta HTTPS se perder, sem emitir outro.
+    try:
+        csr = x509.load_pem_x509_csr(csr_pem.encode())
+        public = csr.public_key()
+        if not (isinstance(public, rsa.RSAPublicKey) and public.key_size == 2048
+                and public.public_numbers().e == 65537
+                and csr.signature_algorithm_oid == SignatureAlgorithmOID.RSA_WITH_SHA256
+                and csr.is_signature_valid):
+            raise ValueError('Assinatura ou algoritmo não permitido')
+        return public
+    except (ValueError, TypeError, x509.InvalidVersion) as exc:
+        raise EnrollmentError(400, 'CSR requer RSA-2048 e assinatura SHA256withRSA válida.') from exc
+
+
+def enrolled_response(state, record):
+    return {'device_id': record['id'], 'account': record['account'],
+            'certificate': record['certificate'], 'ca': (state / 'ca.crt').read_text(),
+            'attestation': json.loads(record['attestation_result'])}
+
+
+def enroll(state, token, data, attestor):
+    if set(data) != {'csr', 'attestation_chain'}:
+        raise EnrollmentError(400, 'Envie csr e attestation_chain.')
+    public = public_csr(data['csr'])
+    request_digest = auth.digest(json.dumps(data, sort_keys=True, separators=(',', ':')))
+    with closing(database(state)) as db:
+        grant = auth.grant(db, token)
+    # Rede e JVM fora da transação. A autorização é revalidada atomicamente ao emitir.
+    checked = attestor.verify(data['attestation_chain'], grant['challenge'], public)
     with closing(database(state)) as db, db:
         db.execute('BEGIN IMMEDIATE')
-        grant = db.execute('SELECT * FROM tokens WHERE digest=?',
-                           (hashlib.sha256(token.encode()).hexdigest(),)).fetchone()
-        if grant is None or grant['expires'] <= time.time():
-            raise EnrollmentError(401, 'Token ausente, inválido ou expirado.')
+        grant = auth.grant(db, token)
         if grant['device_id']:
-            if grant['csr_digest'] != digest:
-                raise EnrollmentError(409, 'Token já utilizado para outro pedido.')
-            record = db.execute('SELECT * FROM devices WHERE id=?', (grant['device_id'],)).fetchone()
-            if not record['active']:
+            if grant['request_digest'] != request_digest:
+                raise EnrollmentError(409, 'Autorização já utilizada para outro pedido.')
+            record = db.execute('SELECT * FROM devices WHERE id=? AND active=1 AND attested=1',
+                                (grant['device_id'],)).fetchone()
+            if record is None:
                 raise EnrollmentError(403, 'Identidade revogada.')
-            return dict(record)
-        try:
-            csr = x509.load_pem_x509_csr(csr_pem.encode())
-            public = csr.public_key()
-            if not (isinstance(public, rsa.RSAPublicKey) and public.key_size == 2048
-                    and public.public_numbers().e == 65537
-                    and csr.signature_algorithm_oid == SignatureAlgorithmOID.RSA_WITH_SHA256
-                    and csr.is_signature_valid):
-                raise ValueError('Assinatura ou algoritmo não permitido')
-        except (ValueError, TypeError, x509.InvalidVersion) as exc:
-            raise EnrollmentError(400, 'CSR requer RSA-2048 e assinatura SHA256withRSA válida.') from exc
+            return enrolled_response(state, record)
         device_id = str(uuid.uuid4())
         ca, ca_key = load_ca(state)
-        # Subject/extensões do CSR são ignorados: a política e a conta vêm do banco.
+        # A conta vem do login/MFA. Subject e extensões solicitados pelo CSR são ignorados.
         cert = leaf_certificate(public, device_id, ca, ca_key, ExtendedKeyUsageOID.CLIENT_AUTH)
         record = {'id': device_id, 'account': grant['account'], 'fingerprint': fingerprint(cert),
-                  'certificate': cert.public_bytes(PEM).decode(), 'active': 1}
-        db.execute('INSERT INTO devices(id,account,fingerprint,certificate) VALUES (?,?,?,?)',
-                   (device_id, record['account'], record['fingerprint'], record['certificate']))
-        db.execute('UPDATE tokens SET csr_digest=?,device_id=? WHERE digest=?',
-                   (digest, device_id, grant['digest']))
+                  'certificate': cert.public_bytes(PEM).decode(), 'attestation_result': json.dumps(checked)}
+        db.execute('''INSERT INTO devices(id,account,fingerprint,certificate,attested,
+            attestation_chain,attestation_result,attested_at) VALUES (?,?,?,?,1,?,?,?)''',
+                   (device_id, record['account'], record['fingerprint'], record['certificate'],
+                    json.dumps(data['attestation_chain']), record['attestation_result'], time.time()))
+        db.execute('INSERT INTO client_certificates VALUES (?,?,?,?)',
+                   (record['fingerprint'], device_id, record['certificate'], cert.not_valid_after_utc.timestamp()))
+        db.execute('UPDATE enrollment_grants SET request_digest=?,device_id=? WHERE digest=?',
+                   (request_digest, device_id, grant['digest']))
+        LOG.info('ATESTACAO_OK dispositivo=%s nivel=%s boot=%s', device_id,
+                 checked['security_level'], checked['boot_state'])
         LOG.info('CADASTRO_EMITIDO dispositivo=%s conta=%s', device_id, grant['account'])
-        return record
+        return enrolled_response(state, record)
+
+
+def active_device(db, peer):
+    record = db.execute('''SELECT d.* FROM devices d JOIN client_certificates c ON c.device_id=d.id
+        WHERE c.fingerprint=? AND c.accept_until>? AND d.active=1 AND d.attested=1''',
+                        (fingerprint(peer), time.time())).fetchone()
+    if record is None:
+        raise EnrollmentError(403, 'Identidade não atestada, não cadastrada, expirada ou revogada.')
+    return record
+
+
+def renew_client(state, peer, token, attestor):
+    with closing(database(state)) as db:
+        device = active_device(db, peer)
+        auth.session(db, token, device)
+    # Atestação histórica não prova o estado atual do boot. Rechecamos revogação;
+    # após 30 dias exigimos novo cadastro/atestação com chave e challenge novos.
+    if device['attested_at'] + 30 * 86400 <= time.time():
+        raise EnrollmentError(403, 'Atestação tem 30 dias. Faça novo cadastro com login/MFA e nova chave.')
+    attestor.check_revocation(json.loads(device['attestation_chain']))
+    with closing(database(state)) as db, db:
+        db.execute('BEGIN IMMEDIATE')
+        device = active_device(db, peer)
+        auth.session(db, token, device)
+        old = fingerprint(peer)
+        pending = db.execute('''SELECT c.* FROM renewals r JOIN client_certificates c
+            ON c.fingerprint=r.new_fingerprint WHERE r.old_fingerprint=?''', (old,)).fetchone()
+        if pending:
+            if pending['accept_until'] <= time.time():
+                raise EnrollmentError(409, 'Renovação anterior já superada.')
+            pem = pending['certificate']
+        else:
+            if old != device['fingerprint']:
+                raise EnrollmentError(409, 'Use o certificado mais recente.')
+            ca, ca_key = load_ca(state)
+            cert = leaf_certificate(peer.public_key(), device['id'], ca, ca_key, ExtendedKeyUsageOID.CLIENT_AUTH)
+            pem = cert.public_bytes(PEM).decode()
+            db.execute('INSERT INTO client_certificates VALUES (?,?,?,?)',
+                       (fingerprint(cert), device['id'], pem, cert.not_valid_after_utc.timestamp()))
+            db.execute('INSERT INTO renewals VALUES (?,?)', (old, fingerprint(cert)))
+            db.execute('UPDATE client_certificates SET accept_until=MIN(accept_until,?) WHERE fingerprint=?',
+                       (time.time() + 300, old))
+            db.execute('UPDATE devices SET certificate=?,fingerprint=? WHERE id=?',
+                       (pem, fingerprint(cert), device['id']))
+        LOG.info('CERTIFICADO_RENOVADO dispositivo=%s transporte=mtls', device['id'])
+        return {'certificate': pem, 'ca': (state / 'ca.crt').read_text(), 'device_id': device['id']}
 
 
 def tls_context(state, mutual):
@@ -212,71 +276,125 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
         self.close_connection = True
 
-    def do_POST(self):
-        if self.server.mutual or self.path != '/enroll':
-            return self.reply(404, {'erro': 'Rota inexistente.'})
+    def body(self):
+        lengths = self.headers.get_all('Content-Length', [])
+        if len(lengths) != 1 or self.headers.get('Transfer-Encoding'):
+            raise EnrollmentError(400, 'Content-Length único obrigatório; sem Transfer-Encoding.')
         try:
-            lengths = self.headers.get_all('Content-Length', [])
-            if len(lengths) != 1 or self.headers.get('Transfer-Encoding'):
-                raise EnrollmentError(400, 'Content-Length único obrigatório; sem Transfer-Encoding.')
-            try:
-                length = int(lengths[0])
-            except ValueError:
-                raise EnrollmentError(400, 'Content-Length inválido.')
-            if not 0 < length <= MAX_BODY:
-                raise EnrollmentError(413, 'Pedido excede o limite de 16 KiB.')
-            if self.headers.get_content_type() != 'application/json':
-                raise EnrollmentError(415, 'Use application/json.')
-            auth = self.headers.get('Authorization', '')
-            token = auth[7:] if auth.startswith('Bearer ') else ''
-            data = json.loads(self.rfile.read(length))
-            if not isinstance(data, dict) or set(data) != {'csr'}:
-                raise EnrollmentError(400, 'Envie apenas o campo csr.')
-            record = enroll(self.server.state, token, data['csr'])
-            self.reply(200, {'device_id': record['id'], 'account': record['account'],
-                             'certificate': record['certificate'],
-                             'ca': (self.server.state / 'ca.crt').read_text()})
+            length = int(lengths[0])
+        except ValueError:
+            raise EnrollmentError(400, 'Content-Length inválido.')
+        if not 0 < length <= MAX_BODY:
+            raise EnrollmentError(413, 'Pedido excede 128 KiB.')
+        if self.headers.get_content_type() != 'application/json':
+            raise EnrollmentError(415, 'Use application/json.')
+        data = json.loads(self.rfile.read(length))
+        if not isinstance(data, dict):
+            raise EnrollmentError(400, 'JSON deve ser um objeto.')
+        return data
+
+    def bearer(self):
+        values = self.headers.get_all('Authorization', [])
+        if len(values) != 1 or not re.fullmatch(r'Bearer [A-Za-z0-9_-]{43}', values[0]):
+            return ''
+        return values[0][7:]
+
+    def handle_api(self, post):
+        try:
+            bootstrap_routes = {'/auth/enrollment', '/enroll'}
+            mutual_routes = {'/session', '/logout', '/renew'} if post else {'/account'}
+            if not self.server.mutual:
+                if not post or self.path not in bootstrap_routes:
+                    raise EnrollmentError(404, 'Rota inexistente.')
+                data = self.body()
+                if self.path == '/auth/enrollment':
+                    response = auth.new_grant(self.server.state, data)
+                    LOG.info('MFA_OK finalidade=cadastro')
+                else:
+                    response = enroll(self.server.state, self.bearer(), data, self.server.attestor)
+            else:
+                if self.path not in mutual_routes:
+                    raise EnrollmentError(404, 'Rota inexistente.')
+                peer = x509.load_der_x509_certificate(self.connection.getpeercert(binary_form=True))
+                with closing(database(self.server.state)) as db:
+                    device = active_device(db, peer)
+                data = self.body() if post else None
+                if self.path == '/session':
+                    response = auth.new_session(self.server.state, device, data)
+                    LOG.info('SESSAO_CRIADA dispositivo=%s', device['id'])
+                else:
+                    if post and data:
+                        raise EnrollmentError(400, 'Envie um objeto JSON vazio.')
+                    with closing(database(self.server.state)) as db, db:
+                        device = active_device(db, peer)
+                        user_session = auth.session(db, self.bearer(), device)
+                        if self.path == '/logout':
+                            db.execute('UPDATE sessions SET active=0 WHERE digest=?', (user_session['digest'],))
+                            LOG.info('SESSAO_ENCERRADA dispositivo=%s', device['id'])
+                    if self.path == '/renew':
+                        response = renew_client(self.server.state, peer, self.bearer(), self.server.attestor)
+                    elif self.path == '/logout':
+                        response = {'logged_out': True}
+                    else:
+                        response = {'mtls': True, 'user_session': True, 'account': device['account'],
+                                    'device_id': device['id'], 'tls': self.connection.version(),
+                                    'mensagem': 'Conta de demonstração; sem dados bancários reais.'}
+            self.reply(200, response)
         except EnrollmentError as exc:
-            LOG.warning('CADASTRO_RECUSADO status=%s', exc.status)
+            LOG.warning('PEDIDO_RECUSADO status=%s', exc.status)
             self.reply(exc.status, {'erro': str(exc)})
         except (ValueError, UnicodeError):
-            self.reply(400, {'erro': 'JSON inválido.'})
+            self.reply(400, {'erro': 'JSON ou valor inválido.'})
         except Exception:
-            LOG.exception('CADASTRO_FALHOU')
-            self.reply(500, {'erro': 'Não foi possível emitir o certificado.'})
+            LOG.exception('PEDIDO_FALHOU')
+            self.reply(500, {'erro': 'Falha interna. Consulte os logs locais.'})
+
+    def do_POST(self):
+        self.handle_api(True)
 
     def do_GET(self):
-        if not self.server.mutual or self.path != '/account':
-            return self.reply(404, {'erro': 'Rota inexistente.'})
-        cert = x509.load_der_x509_certificate(self.connection.getpeercert(binary_form=True))
-        with closing(database(self.server.state)) as db:
-            device = db.execute('SELECT * FROM devices WHERE fingerprint=? AND active=1',
-                                (fingerprint(cert),)).fetchone()
-        if device is None:
-            return self.reply(403, {'erro': 'Identidade não cadastrada ou revogada.'})
-        self.reply(200, {'mtls': True, 'account': device['account'], 'device_id': device['id'],
-                         'tls': self.connection.version(), 'mensagem': 'Conta de demonstração; sem dados bancários reais.'})
+        self.handle_api(False)
 
     def log_request(self, code='-', size='-'):
-        # Nunca registrar Authorization, CSR, corpos ou query strings.
-        LOG.info('HTTP_RESPOSTA servico=%s metodo=%s caminho=%r status=%s',
-                 'mtls' if self.server.mutual else 'cadastro', self.command,
-                 getattr(self, 'path', '').split('?', 1)[0], code)
+        path = getattr(self, 'path', '').split('?', 1)[0]
+        if path not in {'/auth/enrollment', '/enroll', '/session', '/account', '/renew', '/logout'}:
+            path = '<desconhecido>'
+        LOG.info('HTTP_RESPOSTA servico=%s metodo=%s caminho=%s status=%s',
+                 'mtls' if self.server.mutual else 'cadastro', self.command, path, code)
 
     def log_message(self, message, *args):
-        LOG.warning('HTTP_EVENTO mensagem=%r', message % args)
+        # BaseHTTPServer pode incluir a linha de request em erros. Não ecoar entrada livre.
+        LOG.warning('HTTP_PROTOCOLO_EVENTO')
 
 
 class Server(ThreadingHTTPServer):
     daemon_threads = True
     allow_reuse_address = True
 
-    def __init__(self, state, port, mutual):
+    def __init__(self, state, port, mutual, attestor=None):
         self.state, self.mutual = state, mutual
+        self.attestor = attestor or GoogleAttestation(state)
+        self.workers = threading.BoundedSemaphore(8)
         self.context = tls_context(state, mutual)
         super().__init__(('127.0.0.1', port), Handler)
 
+    def process_request(self, request, address):
+        if not self.workers.acquire(blocking=False):
+            request.close()
+            return
+        try:
+            super().process_request(request, address)
+        except Exception:
+            self.workers.release()
+            raise
+
     def process_request_thread(self, raw, address):
+        try:
+            self.tls_worker(raw, address)
+        finally:
+            self.workers.release()
+
+    def tls_worker(self, raw, address):
         # TLS no worker: um cliente lento não bloqueia o accept dos demais.
         raw.settimeout(10)
         try:
@@ -293,11 +411,11 @@ class Server(ThreadingHTTPServer):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument('action', choices=['init', 'token', 'devices', 'revoke', 'renew', 'test', 'serve'])
+    parser.add_argument('action', choices=['init', 'create-user', 'devices', 'revoke', 'renew', 'test', 'check', 'serve'])
     parser.add_argument('--port', type=int, default=8443)
     parser.add_argument('--enrollment-port', type=int, default=8444)
     parser.add_argument('--account', default='aluno')
-    parser.add_argument('--ttl', type=int, default=600)
+    parser.add_argument('--generate-password', action='store_true')
     parser.add_argument('--device')
     args = parser.parse_args()
     logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
@@ -310,14 +428,24 @@ def main():
     initialize(STATE)
     if args.action == 'init':
         print(f'CA e servidor disponíveis em {STATE}; nenhuma chave de cliente foi gerada.')
-    elif args.action == 'token':
-        print(new_token(STATE, args.account, args.ttl))
+    elif args.action == 'create-user':
+        import getpass
+        password = secrets.token_urlsafe(18) if args.generate_password else getpass.getpass('Senha (12–128 caracteres): ')
+        provision = auth.create_user(STATE, args.account, password)
+        if args.generate_password:
+            provision['password'] = password
+        target = STATE / ('provision-' + args.account + '.json')
+        with target.open('x') as stream:
+            json.dump(provision, stream, indent=2)
+        target.chmod(0o600)
+        print(f'Usuário criado. Dados privados de provisionamento: {target}')
+        print('Importe o segredo TOTP no autenticador. Esse arquivo não vai para o Git.')
     elif args.action == 'renew':
         renew_server(STATE)
         print('Certificado do servidor renovado. Reinicie o servidor. Clientes mantêm sua validade própria.')
     elif args.action == 'devices':
         with closing(database(STATE)) as db:
-            for row in db.execute('SELECT id,account,active FROM devices ORDER BY rowid'):
+            for row in db.execute('SELECT id,account,active,attested FROM devices ORDER BY rowid'):
                 print(json.dumps(dict(row)))
     elif args.action == 'revoke':
         with closing(database(STATE)) as db, db:
@@ -325,10 +453,16 @@ def main():
         if not changed:
             parser.error('Informe --device com um identificador de devices.')
         print('Identidade revogada; a API recusará a próxima requisição.')
+    elif args.action == 'check':
+        GoogleAttestation(STATE).preflight()
+        tls_context(STATE, True)
+        print('Configuração local pronta.')
     else:
+        attestor = GoogleAttestation(STATE)
+        attestor.preflight()
         with ExitStack() as stack:
-            enrollment = stack.enter_context(Server(STATE, args.enrollment_port, False))
-            api = stack.enter_context(Server(STATE, args.port, True))
+            enrollment = stack.enter_context(Server(STATE, args.enrollment_port, False, attestor))
+            api = stack.enter_context(Server(STATE, args.port, True, attestor))
             thread = threading.Thread(target=enrollment.serve_forever, daemon=True)
             thread.start()
             LOG.info('SERVIDOR_INICIADO cadastro=https://localhost:%s/enroll api=https://localhost:%s/account',

@@ -11,19 +11,20 @@ import android.widget.TextView;
 import java.util.ArrayList;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import org.json.JSONObject;
 
-/** App comum: somente INTERNET. Chave da instalação criada no Android Keystore. */
+/** App comum com INTERNET: cadastro atestado, sessão e operações mTLS. */
 public final class MainActivity extends Activity {
     private final ExecutorService worker = Executors.newSingleThreadExecutor();
     private final ArrayList<Button> buttons = new ArrayList<>();
-    private TextView identityView;
-    private TextView result;
-    private EditText token;
-    private Button enroll;
+    private TextView identityView, result;
+    private EditText account, password, otp;
+    private BankApi bank;
 
     @Override public void onCreate(Bundle state) {
         super.onCreate(state);
-        int padding = (int) (18 * getResources().getDisplayMetrics().density);
+        bank = new BankApi(this);
+        int padding = (int)(16 * getResources().getDisplayMetrics().density);
         LinearLayout content = new LinearLayout(this);
         content.setOrientation(LinearLayout.VERTICAL);
         content.setPadding(padding, padding, padding, padding);
@@ -32,67 +33,90 @@ public final class MainActivity extends Activity {
                     padding, padding + insets.getSystemWindowInsetBottom());
             return insets;
         });
-        content.addView(text("Banco Lab · identidade no aparelho", 23));
-        content.addView(text("A chave privada é gerada nesta instalação. O cadastro usa HTTPS; "
-                + "o acesso à conta exige mTLS. O token representa uma autorização prévia do banco.", 16));
-        identityView = text("Carregando identidade…", 14);
-        identityView.setTextIsSelectable(true);
+        content.addView(text("Banco Lab · atestação + mTLS", 22));
+        content.addView(text("Cadastro: senha e TOTP → chave no Keystore → atestação verificada pelo banco. "
+                + "Depois, entre por mTLS para criar uma sessão de usuário.", 14));
+        identityView = text("Carregando…", 13);
         content.addView(identityView);
-        addButton(content, "1. Gerar chave no aparelho", () -> {
-            new BankIdentity().ensureKey();
-            return "Chave pronta. O certificado local é provisório até o cadastro no banco.";
+        account = field(content, "Conta", InputType.TYPE_CLASS_TEXT);
+        password = field(content, "Senha", InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_PASSWORD);
+        otp = field(content, "Código TOTP (6 dígitos)", InputType.TYPE_CLASS_NUMBER);
+        otp.setFilters(new android.text.InputFilter[]{new android.text.InputFilter.LengthFilter(6)});
+        addCredentialsButton(content, "1. Cadastrar / retomar cadastro", true);
+        addCredentialsButton(content, "2. Entrar por mTLS", false);
+        addButton(content, "3. Consultar conta", () -> bank.account().toString(2));
+        addButton(content, "4. Renovar certificado por mTLS", () -> {
+            bank.renew();
+            return "Certificado renovado. A chave privada e a sessão de usuário foram preservadas.";
         });
-        token = new EditText(this);
-        token.setHint("Token de cadastro (gerado no servidor)");
-        token.setSingleLine(true);
-        token.setInputType(InputType.TYPE_CLASS_TEXT | InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD);
-        token.setSaveEnabled(false);
-        token.setImportantForAutofill(android.view.View.IMPORTANT_FOR_AUTOFILL_NO);
-        content.addView(token);
-        enroll = new Button(this);
-        enroll.setText("2. Cadastrar identidade por HTTPS");
-        enroll.setAllCaps(false);
-        enroll.setOnClickListener(view -> {
-            String value = token.getText().toString().trim();
-            token.setText("");
-            execute(() -> {
-                BankApi.enroll(new BankIdentity(), value);
-                return "Cadastro concluído. O certificado do banco foi associado à chave local. "
-                        + "Agora acesse a conta por mTLS.";
-            });
+        addButton(content, "Sair da sessão", () -> {
+            bank.logout();
+            return "Sessão encerrada. A identidade mTLS continua instalada.";
         });
-        buttons.add(enroll);
-        content.addView(enroll);
-        addButton(content, "3. Acessar conta por mTLS", () -> BankApi.account(new BankIdentity()).toString(2));
-        addButton(content, "Teste: acessar sem identidade", () -> {
-            BankApi.account(null);
-            return "ERRO: o servidor aceitou acesso sem certificado.";
-        });
-        result = text("O servidor precisa estar ativo. Cadastro: porta 8444. API: porta 8443.", 15);
+        addButton(content, "Teste: mTLS sem sessão", () -> bank.withoutSession().toString(2));
+        addButton(content, "Teste: sem certificado mTLS", () -> bank.withoutIdentity().toString(2));
+        result = text("Servidor: HTTPS 8444 e mTLS 8443. Use um novo TOTP em cada login.", 14);
         result.setTextIsSelectable(true);
         content.addView(result);
         ScrollView scroll = new ScrollView(this);
         scroll.setFillViewport(true);
         scroll.addView(content);
         setContentView(scroll);
-        execute(() -> "Use os passos acima. Nenhum arquivo .p12 é necessário.");
+        execute(() -> "O cadastro não cria uma sessão. Após cadastrar, aguarde o próximo código TOTP e entre.");
+    }
+
+    private EditText field(LinearLayout content, String hint, int type) {
+        EditText field = new EditText(this);
+        field.setHint(hint);
+        field.setInputType(type);
+        field.setSingleLine(true);
+        field.setSaveEnabled(false);
+        field.setImportantForAutofill(android.view.View.IMPORTANT_FOR_AUTOFILL_NO);
+        content.addView(field);
+        return field;
+    }
+
+    private void addCredentialsButton(LinearLayout content, String label, boolean enrollment) {
+        Button button = button(content, label);
+        button.setOnClickListener(view -> {
+            try {
+                JSONObject credentials = BankApi.credentials(account.getText().toString().trim(),
+                        password.getText().toString(), otp.getText().toString().trim());
+                password.setText("");
+                otp.setText("");
+                ((android.view.inputmethod.InputMethodManager)getSystemService(INPUT_METHOD_SERVICE))
+                        .hideSoftInputFromWindow(otp.getWindowToken(), 0);
+                execute(() -> {
+                    if (enrollment) {
+                        bank.enroll(credentials);
+                        return "Atestação aprovada e certificado instalado. Agora entre por mTLS, com um novo TOTP.";
+                    }
+                    bank.login(credentials);
+                    return "Login/MFA confirmado por mTLS. Sessão de usuário criada por 15 minutos.";
+                });
+            } catch (Exception error) { result.setText(error.getMessage()); }
+        });
     }
 
     private TextView text(String value, int size) {
         TextView view = new TextView(this);
         view.setText(value);
         view.setTextSize(size);
-        view.setPadding(0, 10, 0, 16);
+        view.setPadding(0, 6, 0, 8);
         return view;
     }
 
-    private void addButton(LinearLayout content, String label, Action action) {
+    private Button button(LinearLayout content, String label) {
         Button button = new Button(this);
         button.setText(label);
         button.setAllCaps(false);
-        button.setOnClickListener(view -> execute(action));
         buttons.add(button);
         content.addView(button);
+        return button;
+    }
+
+    private void addButton(LinearLayout content, String label, Action action) {
+        button(content, label).setOnClickListener(view -> execute(action));
     }
 
     private interface Action { String run() throws Exception; }
@@ -103,33 +127,26 @@ public final class MainActivity extends Activity {
         worker.execute(() -> {
             String message;
             String description = "Identidade indisponível.";
-            boolean registered = false;
             try { message = action.run(); }
-            catch (Exception error) {
-                message = error.getClass().getSimpleName() + ": " + error.getMessage()
-                        + "\nFalhas de rede não comprovam recusa de certificado; confira os logs do servidor.";
-            }
+            catch (Exception error) { message = error.getClass().getSimpleName() + ": " + error.getMessage(); }
             try {
-                BankIdentity identity = new BankIdentity();
-                description = identity.description();
-                registered = identity.enrolled();
+                BankIdentity identity = BankIdentity.active(this);
+                description = (identity == null ? "Sem identidade atestada. Faça o cadastro." : identity.description())
+                        + "\n" + bank.sessionDescription();
             } catch (Exception error) { description = error.toString(); }
             String finalMessage = message;
             String finalDescription = description;
-            boolean finalRegistered = registered;
             runOnUiThread(() -> {
                 if (isDestroyed()) return;
                 result.setText(finalMessage);
                 identityView.setText(finalDescription);
                 for (Button button : buttons) button.setEnabled(true);
-                enroll.setEnabled(!finalRegistered);
-                token.setEnabled(!finalRegistered);
             });
         });
     }
 
     @Override protected void onDestroy() {
         worker.shutdownNow();
-        super.onDestroy();
+        super.onDestroy(); // Sessão só em memória; não é gravada nas preferências.
     }
 }
