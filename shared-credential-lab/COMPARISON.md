@@ -3,7 +3,7 @@
 Objetivo: demonstrar o custo e o alcance de cada credencial antes de preparar a
 apresentação ao gerente. Os resultados de execução ficam em [VALIDATION.md](VALIDATION.md).
 
-| Dimensão | Compartilhada: esta pasta | Por instalação: raiz do repositório |
+| Dimensão | Compartilhada: esta pasta | [Por instalação](../per-installation-lab/README.md): `per-installation-lab/` |
 |---|---|---|
 | Criação da chave privada | Servidor; a mesma chave é distribuída | Android Keystore em cada instalação |
 | Transporte da chave | P12 e senha por HTTPS com pinning | Chave privada não é enviada; CSR/cadeia são públicos |

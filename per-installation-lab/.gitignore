@@ -1,5 +1,5 @@
 # Credenciais, logs e dados gerados localmente
-.local/
+/.local/
 *.key
 *.pem
 *.crt

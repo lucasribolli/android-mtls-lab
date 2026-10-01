@@ -74,7 +74,7 @@ cd /home/lucas/Documents/Codex/2026-09-17/x20/outputs/android-mtls-lab/shared-cr
 
 Em outra máquina, clone o repositório, entre em `shared-credential-lab/` e configure
 `JAVA_HOME`, `ANDROID_HOME` e `PATH` para seus próprios JDK/SDK. Os próximos comandos
-são executados **dentro desta pasta**, não na raiz do laboratório anterior.
+são executados **dentro desta pasta**, não na raiz do repositório nem em `per-installation-lab/`.
 
 ### 1. Preparar PKI, Python e APK
 
@@ -126,7 +126,7 @@ server/.venv/bin/python server/lab.py rasp approved
 ```
 
 O script encerra somente a instância anterior **deste** servidor, após verificar o
-estado, e inicia outra. Não encerra o servidor da raiz do repositório. Fica em primeiro
+estado, e inicia outra. Não encerra o servidor de `per-installation-lab/`. Fica em primeiro
 plano; `Ctrl+C` encerra. Para continuar trabalhando, deixe esse terminal aberto.
 
 | Listener | Função |
@@ -290,7 +290,8 @@ desative verificações de validade para contornar certificado expirado.
 O pin de reserva permite uma futura troca controlada de chave do servidor; o listener
 de diagnóstico comprova a aceitação dessa chave, sem implementar toda a automação de
 rotação. A chave cliente compartilhada exige planejamento próprio de distribuição,
-sobreposição e revogação. No laboratório anterior, a renovação por mTLS já existe.
+sobreposição e revogação. No [laboratório de chave por instalação](../per-installation-lab/README.md),
+a renovação por mTLS já existe.
 
 Servidor Python/SQLite, CA e chaves em arquivos e RASP DEMO são escolhas didáticas.
 Não há integração IdP bancária, HSM, Play Integrity, antifraude ou RASP comercial.
