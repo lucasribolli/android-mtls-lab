@@ -1,0 +1,36 @@
+# Credenciais, logs e dados gerados localmente
+/.local/
+*.key
+*.pem
+*.crt
+*.csr
+*.p12
+*.pfx
+*.jks
+*.keystore
+*.log
+.env
+.env.*
+
+# Android / Gradle / editores
+**/build/
+.gradle/
+.kotlin/
+.idea/
+.vscode/
+local.properties
+*.iml
+*.apk
+*.aab
+.cxx/
+.externalNativeBuild/
+
+# Python / sistema operacional
+__pycache__/
+*.py[cod]
+.venv/
+.DS_Store
+Thumbs.db
+
+# Configuração de pinning gerada pela preparação
+/android/app/src/debug/res/xml/network_security_config.xml

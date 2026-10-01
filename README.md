@@ -1,5 +1,17 @@
 # Banco Lab: Android Key Attestation, login/MFA e mTLS
 
+Este repositório contém dois laboratórios independentes:
+
+| Laboratório | Pasta | App | Portas |
+|---|---|---|---|
+| Chave por instalação, gerada no Android Keystore e atestada | Esta raiz (`android/`, `server/`, `scripts/`) | `lab.mtls` | 8443 / 8444 |
+| Uma chave compartilhada, entregue por HTTPS com pinning e RASP **simulado** | [`shared-credential-lab/`](shared-credential-lab/README.md) | `lab.mtls.shared` | 8543 / 8544; diagnósticos 8545 / 8546 |
+
+Os apps podem coexistir no mesmo aparelho. Cada laboratório tem seu servidor,
+ambiente Python e estado privado próprios; ambos ficam no **mesmo repositório Git**.
+O restante deste README descreve o laboratório de **chave por instalação**.
+Veja também a [comparação técnica inicial](shared-credential-lab/COMPARISON.md).
+
 Laboratório local de um app bancário comum, sem permissões privilegiadas. O app gera
 uma chave RSA no **Android Keystore**, recebe uma cadeia de **atestação** e envia um
 CSR e essa cadeia ao banco por HTTPS. O servidor valida a atestação contra raízes
