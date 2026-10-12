@@ -11,6 +11,10 @@
 *.log
 .env
 .env.*
+p12-password
+*.db
+*.db-*
+*.sqlite*
 
 # Android / Gradle / editores
 **/build/
