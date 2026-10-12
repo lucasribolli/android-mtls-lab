@@ -301,6 +301,76 @@ exercitar rotação/retirada, múltiplos aparelhos e versões Android. O servido
 Python é didático, sem recursos de WAF, HTTP/2, alta disponibilidade ou identidade
 exclusiva por aparelho. Não é um gateway de produção.
 
+## Equivalente iOS — arquitetura proposta e cuidados
+
+**iOS é uma proposta documental: não há app, build ou teste iOS neste repo.**
+Os resultados em [VALIDATION.md](VALIDATION.md) pertencem ao Android/servidores
+testados. O detalhamento, fontes oficiais e checklist **NÃO EXECUTADO** estão em
+[IOS.md](IOS.md).
+
+```text
+Build privado → PKCS#12 + input de senha → recurso do bundle iOS
+Primeiro uso → SecPKCS12Import → validar → persistir no Keychain
+Requests seguintes → recuperar SecIdentity → URLSession existente
+  → HTTPS + validação do servidor + SPKI pinning + certificado cliente
+  → WAF / LB / API Gateway TERMINA mTLS
+  → conexão interna autenticada + metadata gerada pelo gateway
+  → backend Spring: JWT/sessão e autorização
+```
+
+A plataforma mobile não muda a fronteira de confiança: o gateway exige certificado,
+cadeia, validade, `clientAuth` e geração autorizada; descarta headers reservados
+externos e os recria a partir do handshake. O backend verifica o canal e a identidade
+do gateway antes de usar essa metadata. Se houver mTLS interno, o certificado visto
+pelo Spring é do **serviço gateway**, não do iPhone. mTLS compartilhado continua
+separado de login/MFA e da autorização de usuário; TLS cifra as requests, sem
+criptografia manual de payload.
+
+O P12 e a senha/configuração seriam inputs privados de build, fora do Git e dos
+logs/argumentos de comandos. Bundle, IPA, archives, caches e artefatos de CI também
+exigem controle de acesso. O app precisa usar P12 e senha em runtime: a senha não
+é uma segunda barreira forte independente. A Apple desaconselha embutir senhas em
+apps; manter esse modelo é um trade-off explícito da proposta, não uma recomendação
+Apple. Importar no Keychain não apaga a cópia do bundle, e assinatura/sandbox não
+provam impossibilidade de extração. [Apple: Importing an Identity](https://developer.apple.com/documentation/security/importing-an-identity).
+
+O provider proposto primeiro consultaria uma identidade versionada e válida no
+Keychain; só abriria o P12 quando necessário. Importação, validação, persistência e
+recuperação de `SecIdentity` são etapas distintas: não presumir no iOS a persistência
+automática descrita para macOS. Tratar duplicidade, concorrência, access groups,
+sincronização e acessibilidade `ThisDeviceOnly`; escolher disponibilidade em
+background de acordo com o produto. Reinstalação não deve ser tratada como garantia
+de limpeza do Keychain. [Procedimento e decisões pendentes](IOS.md#importação-persistência-e-reutilização).
+
+**Uma chave compartilhada previamente gerada e distribuída em um PKCS#12 não se
+transforma em uma chave originalmente gerada e não exportável no Secure Enclave
+ao ser armazenada no Keychain.** A chave RSA deste lab não pode ser importada no
+Secure Enclave. O diagnóstico Android `getEncoded()==null` não é uma garantia
+transferível para iOS. [Apple: Protecting keys with the Secure Enclave](https://developer.apple.com/documentation/security/protecting-keys-with-the-secure-enclave).
+
+A integração proposta adiciona a identidade ao challenge de certificado cliente
+da `URLSession` existente. O tratamento de confiança do servidor permanece
+separado, preservando hostname, cadeia, validade, ATS e pins principal/backup.
+O pin continua sendo `Base64(SHA-256(DER SubjectPublicKeyInfo))` do **gateway**;
+bytes brutos de uma chave não são automaticamente esse formato.
+[Networking, callbacks e SPKI](IOS.md#networking-existente-mtls-e-pinning).
+
+Todas as instalações de uma geração compartilham identidade. Usar gerações com
+**pares de chaves diferentes por plataforma** permite retirada independente de
+Android/iOS, com mais operação; não identifica aparelhos individualmente.
+Uma chave comum amplia o alcance de um vazamento às duas plataformas.
+Rotação `embedded-v1 → embedded-v2` normalmente exige novo release, sobreposição
+controlada, medição de adoção e retirada de v1. Outra cópia da mesma chave pode
+reutilizar um bearer roubado; retirar uma geração afeta todos os seus usuários.
+
+DexGuard é o produto Android; iXGuard é o produto iOS no portfólio Guardsquare.
+Isso não comprova licença, integração ou eficácia neste projeto. Proteção de
+recursos/código e detecções de jailbreak, hooking, debugger e tampering precisam
+de confirmação e testes da versão contratada, com reação proporcional, tratamento
+de falsos positivos e sem relaxar TLS. [Guardsquare: iXGuard](https://www.guardsquare.com/ixguard).
+**iOS shielding/RASP: NOT IMPLEMENTED / NOT VALIDATED.** Não há `X-RASP`, aprovação
+fake ou prova de integridade derivada automaticamente do mTLS.
+
 ## Git
 
 Publique código e documentação. `.local`, `.venv`, builds, APKs, chaves, P12,

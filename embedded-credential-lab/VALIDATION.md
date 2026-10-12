@@ -89,6 +89,19 @@ allowlist. Acesso direto com esses headers falha na autenticação do serviço.
 | Sem sessão e bearer inválido, com mTLS válido | HTTP 401 |
 | Sem client certificate | falha SSL com serviço disponível |
 | Desinstalar e reinstalar `lab.mtls.embedded`; `mode reinstall` | alias ausente novamente, uma importação, mesmo fingerprint |
+| UI: Login via mTLS com senha/TOTP, Get Account e Logout | sessão autenticada, conta retornada e sessão encerrada; zero releituras do asset |
+| UI: resposta de /account | `mtls_termination=API_GATEWAY`, `internal_peer=gateway-internal`, canal interno `TLSv1.3` |
+
+No teste inicial de UI o aparelho estava bloqueado por PIN; o usuário o desbloqueou.
+Uma tentativa de consulta coincidiu com o reinício controlado dos serviços e perdeu
+a conexão. O ciclo completo foi repetido depois do reinício e passou com os serviços
+estáveis. Nenhuma senha, token ou segredo TOTP foi incluído na evidência publicada.
+
+Também foi executada uma segunda chamada a `run-lab.sh` com as portas já ocupadas:
+ela foi recusada e preservou os processos existentes. SIGTERM ao supervisor deste
+lab encerrou ambos os filhos; a nova execução iniciou gateway e backend separados.
+Os listeners 8643/8650 foram conferidos em loopback e o ADB encaminha apenas
+8643–8646. Os serviços foram deixados rodando após a validação.
 
 Fingerprint público observado antes/depois de reiniciar e reinstalar:
 
@@ -154,13 +167,15 @@ foi gerado. A evidência mostra que **esta build não possui hardening estático
   não testada. Instrumentação Android usada como teste funcional, não prova de RASP.
 - Spring/JWT, OkHttp/Retrofit e gateway comercial: pseudocódigo/design, não executados.
 - Rotação completa, rollout multi-geração, carga, HTTP/2 e retomada TLS: pendentes.
-- UI de login manual depende do aparelho desbloqueado. Os testes Python já cobrem
-  login/MFA/sessão/logout com os dois canais TLS reais.
+- UI de login foi validada após desbloqueio pelo usuário; os testes Python também
+  cobrem login/MFA/sessão/logout com os dois canais TLS reais.
 
 ## Git e isolamento
 
 Chaves, P12, senha, perfis MFA, SQLite, logs, assinatura debug e inputs gerados ficam
 ignorados. O código/README não contém segredos gerados. O APK contém a credencial
 por desenho e também fica fora do Git. A revisão final compara hashes dos arquivos
-versionados dos outros dois labs com a baseline anterior à implementação.
-Não se faz commit nem push como parte destes comandos.
+versionados dos outros dois labs com a baseline anterior à implementação: os
+**65 arquivos permaneceram idênticos**. Valores secretos gerados não foram
+encontrados nos candidatos a versionamento; os artefatos privados foram conferidos
+com `git check-ignore`. Nenhum commit ou push foi realizado.
